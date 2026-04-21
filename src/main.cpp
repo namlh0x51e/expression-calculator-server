@@ -1,39 +1,31 @@
+#include <sched.h>
 #include <spdlog/cfg/env.h>
 #include <spdlog/fmt/bin_to_hex.h>
 #include <spdlog/spdlog.h>
 
-#include <algorithm>
 #include <asio.hpp>
-#include <cctype>
-#include <charconv>
+#include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <exception>
-#include <expected>
-#include <iterator>
 #include <list>
 #include <memory>
 #include <ranges>
-#include <source_location>
-#include <span>
 #include <sstream>
-#include <stack>
-#include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <utility>
-#include <variant>
 
 #include "asio/detached.hpp"
+#include "evaluation_engine.hpp"
 
 using asio::ip::tcp;
-using thread_handle_t = uint32_t;
 
 using namespace std::string_view_literals;
 
 static_assert(sizeof(std::byte) == sizeof(unsigned char));
 
-constexpr auto BUFFER_POOL_SIZE = 1024;
-constexpr auto BUFFER_SIZE = 64 * 1024;
-constexpr auto FRAME_DELIM = '\x0A';
+constexpr auto BUFFER_SIZE = 1024 * 1024;
 
 namespace logger = spdlog;
 
@@ -45,322 +37,6 @@ auto get_thread_id() noexcept -> std::string
     return ss.str();
 }
 
-struct TokenNumber {
-    int64_t value_;
-};
-
-struct TokenOperator {
-    char op_;
-};
-
-struct TokenEof {};
-
-using Token = std::variant<TokenNumber, TokenOperator, TokenEof>;
-
-struct UnknownTokenError {
-    std::size_t offset_;
-};
-
-struct PartialTokenError {
-    std::size_t offset_;
-};
-
-using TokenizerError = std::variant<PartialTokenError, UnknownTokenError>;
-
-class Tokenizer {
-   public:
-    Tokenizer(std::span<std::byte> buffer) noexcept;
-
-    auto next() noexcept -> bool;
-    auto get() const noexcept -> Token const &;
-    auto get_error() const noexcept -> std::optional<TokenizerError> const &;
-
-   private:
-    auto parse_next_token() noexcept -> std::expected<Token, TokenizerError>;
-
-   private:
-    std::span<std::byte> buffer_;
-    std::size_t idx_{};
-    Token next_token_;
-    std::optional<TokenizerError> error_;
-};
-
-Tokenizer::Tokenizer(std::span<std::byte> buffer) noexcept : buffer_{std::move(buffer)} {}
-
-auto Tokenizer::next() noexcept -> bool
-{
-    if (idx_ >= buffer_.size()) {
-        return false;
-    }
-
-    auto token_result = parse_next_token();
-    if (!token_result) {
-        error_ = std::move(token_result.error());
-        assert(error_.has_value());
-
-        if (std::holds_alternative<PartialTokenError>(*error_)) {
-            assert(idx_ == buffer_.size());
-
-            auto const partial_token_offset = std::get<PartialTokenError>(*error_).offset_;
-
-            assert(partial_token_offset < buffer_.size());
-
-            std::memmove(buffer_.data(), buffer_.data() + partial_token_offset, buffer_.size() - partial_token_offset);
-        }
-
-        return false;
-    }
-
-    next_token_ = std::move(*token_result);
-
-    return true;
-}
-
-auto Tokenizer::get() const noexcept -> Token const & { return next_token_; }
-
-auto Tokenizer::get_error() const noexcept -> std::optional<TokenizerError> const & { return error_; }
-
-auto Tokenizer::parse_next_token() noexcept -> std::expected<Token, TokenizerError>
-{
-    assert(buffer_.size() > 0);
-    assert(idx_ < buffer_.size());
-
-    auto is_operator = [](char c) noexcept {
-        return c == '+' || c == '-' || c == '*' || c == '/' || c == '(' || c == ')';
-    };
-
-    while(idx_ < buffer_.size()) {
-        char const c = static_cast<char>(buffer_[idx_]);
-
-        if (c == FRAME_DELIM) {
-            ++idx_;
-            return TokenEof{};
-        }
-
-        if (std::isdigit(c)) {
-            auto const token_end_ptr =
-                std::find_if_not(buffer_.data() + idx_, buffer_.data() + buffer_.size(),
-                                 [](auto const c) noexcept { return std::isdigit(static_cast<char>(c)); });
-
-            if (token_end_ptr == buffer_.data() + buffer_.size()) {
-                return std::unexpected(PartialTokenError{std::exchange(idx_, buffer_.size())});
-            }
-
-            int64_t value;
-            std::from_chars(reinterpret_cast<char *>(buffer_.data() + idx_), reinterpret_cast<char *>(token_end_ptr),
-                            value);
-
-            idx_ = std::distance(buffer_.data(), token_end_ptr);
-            return TokenNumber{value};
-        }
-
-        if (is_operator(c)) {
-            ++idx_;
-            return TokenOperator{c};
-        }
-
-        if (std::isspace(c)) {
-            ++idx_;
-            continue;
-        }
-    };
-
-    return std::unexpected(UnknownTokenError{idx_});
-}
-
-struct EvalErrorDividedByZero {};
-struct EvalErrorInsufficientOperandsAmount {};
-struct EvalErrorInvalidSyntax {};
-
-using EvalError = std::variant<EvalErrorDividedByZero, EvalErrorInsufficientOperandsAmount, EvalErrorInvalidSyntax>;
-
-class EvaluationEngine {
-   public:
-    using on_done_cb_t = std::function<void(std::expected<int64_t, EvalError>)>;
-
-    [[nodiscard]]
-    auto eval(std::span<std::byte> buffer) noexcept -> std::size_t;
-    auto on_done(on_done_cb_t) noexcept -> void;
-
-   private:
-    static constexpr auto get_precedence(char op) noexcept -> uint16_t;
-    static constexpr auto apply(char op, int64_t v1, int64_t v2) noexcept
-        -> std::expected<int64_t, EvalErrorDividedByZero>;
-
-    auto pop_operator_and_eval() noexcept -> std::expected<void, EvalError>;
-
-   private:
-    std::stack<int64_t> value_stack_;
-    std::stack<char> op_stack_;
-    on_done_cb_t on_done_;
-};
-
-auto EvaluationEngine::eval(std::span<std::byte> buffer) noexcept -> std::size_t
-{
-    Tokenizer tokenizer{buffer};
-
-    while (tokenizer.next()) {
-        auto const &token = tokenizer.get();
-        if (std::holds_alternative<TokenNumber>(token)) {
-            logger::debug("TokenNumber({})", std::get<TokenNumber>(token).value_);
-            value_stack_.emplace(std::get<TokenNumber>(token).value_);
-        } else if (std::holds_alternative<TokenOperator>(token)) {
-            auto const op = std::get<TokenOperator>(token).op_;
-
-            logger::debug("TokenOperator({})", op);
-
-            switch (op) {
-                case '(':
-                    op_stack_.push(op);
-                    break;
-                case ')':
-                    while (!op_stack_.empty() && op_stack_.top() != '(') {
-                        auto result = pop_operator_and_eval();
-                        if (!result) {
-                            // TODO
-                            auto src_loc = std::source_location::current();
-                            logger::debug("Unimplemented: {}", src_loc.line());
-                            throw std::runtime_error("Unimplented");
-                        }
-                    }
-
-                    if (op_stack_.empty()) {
-                        // TODO
-                        auto src_loc = std::source_location::current();
-                        logger::debug("Unimplemented: {}", src_loc.line());
-                        throw std::runtime_error("Unimplented");
-                    }
-
-                    op_stack_.pop();
-                    break;
-                default:
-                    while (!op_stack_.empty() && op_stack_.top() != '(' &&
-                           get_precedence(op_stack_.top()) >= get_precedence(op)) {
-                        auto result = pop_operator_and_eval();
-                        if (!result) {
-                            // TODO
-                            auto src_loc = std::source_location::current();
-                            logger::debug("Unimplemented: {}", src_loc.line());
-                            throw std::runtime_error("Unimplented");
-                        }
-                    }
-
-                    op_stack_.push(op);
-                    break;
-            }
-        } else if (std::holds_alternative<TokenEof>(token)) {
-            logger::debug("TokenEof()");
-
-            while (!op_stack_.empty()) {
-                auto result = pop_operator_and_eval();
-                if (!result) {
-                    // TODO
-                    auto src_loc = std::source_location::current();
-                    logger::debug("Unimplemented: {}", src_loc.line());
-                    throw std::runtime_error("Unimplented");
-                }
-            }
-
-            if (value_stack_.empty()) {
-                continue;
-            }
-
-            if (value_stack_.size() != 1) {
-                while (!value_stack_.empty()) value_stack_.pop();
-                while (!op_stack_.empty()) op_stack_.pop();
-                if (on_done_) {
-                    on_done_(std::unexpected(EvalErrorInvalidSyntax{}));
-                }
-                continue;
-            }
-
-            if (on_done_) {
-                auto result = value_stack_.top();
-                value_stack_.pop();
-                on_done_(result);
-            }
-
-            assert(value_stack_.empty());
-        }
-    }
-
-    if (auto err = tokenizer.get_error(); err) {
-        if (std::holds_alternative<PartialTokenError>(*err)) {
-            auto const unhandled_offset = std::get<PartialTokenError>(*err).offset_;
-            return unhandled_offset;
-        } else {
-            // Unknown token error
-        }
-    }
-
-    return 0;
-}
-
-auto EvaluationEngine::on_done(on_done_cb_t cb) noexcept -> void { on_done_ = cb; }
-
-constexpr auto EvaluationEngine::get_precedence(char op) noexcept -> uint16_t
-{
-    switch (op) {
-        case '+':
-            return 1;
-        case '-':
-            return 1;
-        case '*':
-            return 2;
-        case '/':
-            return 2;
-        default:
-            std::unreachable();
-    }
-
-    std::unreachable();
-}
-
-constexpr auto EvaluationEngine::apply(char op, int64_t v1, int64_t v2) noexcept
-    -> std::expected<int64_t, EvalErrorDividedByZero>
-{
-    switch (op) {
-        case '+':
-            return v1 + v2;
-        case '-':
-            return v1 - v2;
-        case '*':
-            return v1 * v2;
-        case '/':
-            if (v2 == 0) {
-                return std::unexpected(EvalErrorDividedByZero{});
-            }
-            return v1 / v2;
-        default:
-            std::unreachable();
-    }
-
-    std::unreachable();
-}
-
-auto EvaluationEngine::pop_operator_and_eval() noexcept -> std::expected<void, EvalError>
-{
-    if (value_stack_.size() < 2) {
-        return std::unexpected(EvalErrorInsufficientOperandsAmount{});
-    }
-
-    auto v2 = value_stack_.top();
-    value_stack_.pop();
-
-    auto v1 = value_stack_.top();
-    value_stack_.pop();
-
-    auto apply_result = apply(op_stack_.top(), v1, v2);
-    if (!apply_result) {
-        return std::unexpected(std::move(apply_result.error()));
-    }
-
-    value_stack_.emplace(*apply_result);
-    op_stack_.pop();
-
-    return {};
-}
-
 class Connection {
    public:
     using on_close_cb_t = std::function<void()>;
@@ -368,6 +44,7 @@ class Connection {
     Connection(tcp::socket socket) noexcept;
 
     auto on_close(on_close_cb_t) noexcept -> void;
+    auto cancel() noexcept -> void;
 
    private:
     auto serve() -> asio::awaitable<void>;
@@ -378,6 +55,7 @@ class Connection {
     std::array<std::byte, BUFFER_SIZE> buffer_;
 
     on_close_cb_t on_close_;
+    asio::cancellation_signal cancel_signal_;
 };
 
 Connection::Connection(tcp::socket socket) noexcept : socket_{std::move(socket)}
@@ -386,7 +64,7 @@ Connection::Connection(tcp::socket socket) noexcept : socket_{std::move(socket)}
         asio::post(socket_.get_executor(), [this, result]() {
             // int64_t is at most 20 characters long
             std::array<std::byte, 24> reply_frame{};
-            std::size_t n;
+            int32_t n;
 
             if (result) {
                 logger::debug("Write back result value: {}", *result);
@@ -396,18 +74,22 @@ Connection::Connection(tcp::socket socket) noexcept : socket_{std::move(socket)}
                 n = std::snprintf(reinterpret_cast<char *>(reply_frame.data()), reply_frame.size(), "SYNTAX ERROR\n");
             }
 
-            asio::async_write(socket_, asio::buffer(reply_frame.data(), n), [](std::error_code ec, auto) {
-                if (ec) {
-                    logger::error("Write back result failed: ", ec.message());
-                }
-            });
+            asio::async_write(socket_, asio::buffer(reply_frame.data(), static_cast<std::size_t>(n)),
+                              [](std::error_code ec, auto) {
+                                  if (ec) {
+                                      logger::error("Write back result failed: {}", ec.message());
+                                  }
+                              });
         });
     });
 
-    asio::co_spawn(socket.get_executor(), [this]() { return serve(); }, asio::detached);
+    asio::co_spawn(socket_.get_executor(), [this]() { return serve(); },
+                   asio::bind_cancellation_slot(cancel_signal_.slot(), asio::detached));
 }
 
 auto Connection::on_close(on_close_cb_t cb) noexcept -> void { on_close_ = cb; }
+
+auto Connection::cancel() noexcept -> void { cancel_signal_.emit(asio::cancellation_type::terminal); }
 
 auto Connection::serve() -> asio::awaitable<void>
 {
@@ -420,9 +102,14 @@ auto Connection::serve() -> asio::awaitable<void>
                           spdlog::to_hex(buffer_.data() + offset, buffer_.data() + offset + n_bytes));
             offset = engine_.eval({buffer_.data(), n_bytes});
         }
+    } catch (std::system_error const &e) {
+        if (e.code() != asio::error::operation_aborted) {
+            logger::error("Exception system error: {}", e.code().message());
+        }
     } catch (std::exception const &e) {
-        logger::error("Exception: ", e.what());
+        logger::error("Exception: {}", e.what());
     }
+    if (on_close_) on_close_();
 }
 
 class TcpServer {
@@ -436,6 +123,7 @@ class TcpServer {
 
    private:
     std::list<std::unique_ptr<Connection>> connections_;
+    asio::cancellation_signal cancel_signal_;
     bool is_stopped_{false};
 };
 
@@ -443,7 +131,7 @@ class WorkerThreadManager {
    public:
     using task_t = std::function<void()>;
 
-    WorkerThreadManager(int32_t num_threads = std::max(std::thread::hardware_concurrency(), 1U)) noexcept;
+    WorkerThreadManager(uint32_t num_threads = std::max(std::thread::hardware_concurrency(), 1U)) noexcept;
 
     ~WorkerThreadManager();
 
@@ -454,15 +142,17 @@ class WorkerThreadManager {
     using work_guard_t = asio::executor_work_guard<asio::io_context::executor_type>;
 
     struct WorkerThread {
+        std::size_t cpu_core_id_;
         asio::io_context ctx_;
         TcpServer tcp_server_;
         std::thread thread_;
         work_guard_t work_guard_;
 
-        WorkerThread() noexcept;
+        WorkerThread(std::size_t cpu_core_id) noexcept;
 
         auto serve(std::string_view address, uint16_t port) noexcept -> void;
         auto join() noexcept -> void;
+        auto set_affinity() noexcept -> void;
     };
 
     std::vector<std::unique_ptr<WorkerThread>> worker_threads_;
@@ -477,7 +167,7 @@ class SignalListener {
     auto run() noexcept -> void;
 
    private:
-    auto handle_signal() -> asio::awaitable<void>;
+    auto handle_signal() noexcept -> asio::awaitable<void>;
 
    private:
     WorkerThreadManager &worker_thread_manager_;
@@ -492,20 +182,23 @@ SignalListener::SignalListener(WorkerThreadManager &worker_thread_manager) noexc
 auto SignalListener::run() noexcept -> void
 {
     asio::co_spawn(ctx_, [this]() noexcept { return handle_signal(); }, asio::detached);
-
-    // TODO: remove this and implement signal handler logic
-    auto work = asio::make_work_guard(ctx_);
-
     ctx_.run();
 }
 
-auto SignalListener::handle_signal() -> asio::awaitable<void>
+auto SignalListener::handle_signal() noexcept -> asio::awaitable<void>
 {
-    // TODO: handle signal handler logic
-    co_return;
+    asio::signal_set signals{ctx_, SIGINT, SIGTERM};
+    auto [ec, sig] = co_await signals.async_wait(asio::as_tuple(asio::use_awaitable));
+    if (!ec) {
+        logger::info("Received signal {}, shutting down", sig);
+        worker_thread_manager_.stop();
+    }
 }
 
-WorkerThreadManager::WorkerThread::WorkerThread() noexcept : tcp_server_{}, work_guard_{asio::make_work_guard(ctx_)} {}
+WorkerThreadManager::WorkerThread::WorkerThread(std::size_t cpu_core_id) noexcept
+    : cpu_core_id_{cpu_core_id}, tcp_server_{}, work_guard_{asio::make_work_guard(ctx_)}
+{
+}
 
 auto WorkerThreadManager::WorkerThread::serve(std::string_view address, uint16_t port) noexcept -> void
 {
@@ -515,20 +208,34 @@ auto WorkerThreadManager::WorkerThread::serve(std::string_view address, uint16_t
         tcp_server_.listen_and_serve(ctx_, address, port);
         logger::debug("Thread {} done", tid);
     }};
+
+    set_affinity();
 }
 
 auto WorkerThreadManager::WorkerThread::join() noexcept -> void
 {
-    work_guard_.reset();
+    tcp_server_.stop();   // cancel accept loop; in-flight connections keep running
+    work_guard_.reset();  // io_context exits when all connections close
     thread_.join();
 }
 
-WorkerThreadManager::WorkerThreadManager(int32_t num_threads) noexcept
+auto WorkerThreadManager::WorkerThread::set_affinity() noexcept -> void
+{
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(cpu_core_id_, &cpuset);
+    int rc = pthread_setaffinity_np(thread_.native_handle(), sizeof(cpu_set_t), &cpuset);
+    if (rc != 0) {
+        logger::warn("Failed to set thread affinity: {}", ::strerror(errno));
+    }
+}
+
+WorkerThreadManager::WorkerThreadManager(uint32_t num_threads) noexcept
 {
     worker_threads_.reserve(num_threads);
 
-    for (auto const _ : std::views::iota(0, num_threads)) {
-        worker_threads_.emplace_back(std::make_unique<WorkerThreadManager::WorkerThread>());
+    for (auto const i : std::views::iota(0U, num_threads)) {
+        worker_threads_.emplace_back(std::make_unique<WorkerThreadManager::WorkerThread>(i));
     }
 }
 
@@ -561,6 +268,10 @@ auto TcpServer::stop() noexcept -> void
     if (std::exchange(is_stopped_, true)) {
         return;
     }
+    for (auto &conn : connections_) {
+        conn->cancel();
+    }
+    cancel_signal_.emit(asio::cancellation_type::terminal);
 }
 
 auto TcpServer::listen_and_serve(asio::io_context &ctx, std::string_view address, uint16_t port) noexcept -> void
@@ -581,8 +292,8 @@ auto TcpServer::listen_and_serve(asio::io_context &ctx, std::string_view address
             acceptor.bind(endpoint);
             acceptor.listen();
 
-            while (true) {
-                try {
+            try {
+                while (true) {
                     tcp::socket socket{exec};
 
                     co_await acceptor.async_accept(socket);
@@ -594,13 +305,16 @@ auto TcpServer::listen_and_serve(asio::io_context &ctx, std::string_view address
                     conn->on_close([this, it = connections_.begin()]() noexcept { connections_.erase(it); });
 
                     logger::debug("Thread id = {} accept connection", get_thread_id());
-
-                } catch (const std::exception &e) {
+                }
+            } catch (const asio::system_error &e) {
+                if (e.code() != asio::error::operation_aborted) {
                     logger::error("Exception while listening for connections: {}", e.what());
                 }
+            } catch (const std::exception &e) {
+                logger::error("Exception while listening for connections: {}", e.what());
             }
         },
-        asio::detached);
+        asio::bind_cancellation_slot(cancel_signal_.slot(), asio::detached));
 
     ctx.run();
 }
@@ -609,7 +323,7 @@ int main(int argc, char **argv)
 {
     spdlog::cfg::load_env_levels();
 
-    uint16_t const port = (argc == 2) ? std::stoi(argv[1]) : 8000;
+    uint16_t const port = (argc == 2) ? static_cast<uint16_t>(std::stoi(argv[1])) : 8000;
 
     WorkerThreadManager worker_thread_manager{};
 
