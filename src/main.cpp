@@ -37,16 +37,18 @@ auto get_thread_id() noexcept -> std::string
     return ss.str();
 }
 
-class Connection {
+class Connection : public std::enable_shared_from_this<Connection> {
    public:
     using on_close_cb_t = std::function<void()>;
 
-    Connection(tcp::socket socket) noexcept;
+    static auto make(tcp::socket socket) noexcept -> std::shared_ptr<Connection>;
 
     auto on_close(on_close_cb_t) noexcept -> void;
     auto cancel() noexcept -> void;
 
    private:
+    explicit Connection(tcp::socket socket) noexcept;
+    auto start() noexcept -> void;
     auto serve() -> asio::awaitable<void>;
 
    private:
@@ -58,24 +60,35 @@ class Connection {
     asio::cancellation_signal cancel_signal_;
 };
 
-Connection::Connection(tcp::socket socket) noexcept : socket_{std::move(socket)}
+auto Connection::make(tcp::socket socket) noexcept -> std::shared_ptr<Connection>
 {
-    engine_.on_done([this](auto result) {
-        asio::post(socket_.get_executor(), [this, result]() {
+    auto conn = std::make_shared<Connection>(std::move(socket));
+    conn->start();
+    return conn;
+}
+
+Connection::Connection(tcp::socket socket) noexcept : socket_{std::move(socket)} {}
+
+auto Connection::start() noexcept -> void
+{
+    engine_.on_done([weak = weak_from_this()](auto result) {
+        auto self = weak.lock();
+        if (!self) return;
+        asio::post(self->socket_.get_executor(), [self, result]() {
             // int64_t is at most 20 characters long
-            std::array<std::byte, 24> reply_frame{};
+            auto reply = std::make_shared<std::array<char, 24>>();
             int32_t n;
 
             if (result) {
                 logger::debug("Write back result value: {}", *result);
-                n = std::snprintf(reinterpret_cast<char *>(reply_frame.data()), reply_frame.size(), "%ld\n", *result);
+                n = std::snprintf(reply->data(), reply->size(), "%ld\n", *result);
             } else {
                 logger::debug("Write back result value: \"SYNTAX ERROR\"");
-                n = std::snprintf(reinterpret_cast<char *>(reply_frame.data()), reply_frame.size(), "SYNTAX ERROR\n");
+                n = std::snprintf(reply->data(), reply->size(), "SYNTAX ERROR\n");
             }
 
-            asio::async_write(socket_, asio::buffer(reply_frame.data(), static_cast<std::size_t>(n)),
-                              [](std::error_code ec, auto) {
+            asio::async_write(self->socket_, asio::buffer(reply->data(), static_cast<std::size_t>(n)),
+                              [self, reply](std::error_code ec, auto) {
                                   if (ec) {
                                       logger::error("Write back result failed: {}", ec.message());
                                   }
@@ -83,7 +96,8 @@ Connection::Connection(tcp::socket socket) noexcept : socket_{std::move(socket)}
         });
     });
 
-    asio::co_spawn(socket_.get_executor(), [this]() { return serve(); },
+    asio::co_spawn(socket_.get_executor(),
+                   [self = shared_from_this()]() { return self->serve(); },
                    asio::bind_cancellation_slot(cancel_signal_.slot(), asio::detached));
 }
 
@@ -122,7 +136,7 @@ class TcpServer {
     auto listen_and_serve(asio::io_context &ctx, std::string_view address, uint16_t port) noexcept -> void;
 
    private:
-    std::list<std::unique_ptr<Connection>> connections_;
+    std::list<std::shared_ptr<Connection>> connections_;
     asio::cancellation_signal cancel_signal_;
     bool is_stopped_{false};
 };
@@ -300,7 +314,8 @@ auto TcpServer::listen_and_serve(asio::io_context &ctx, std::string_view address
 
                     socket.set_option(tcp::no_delay(true));
 
-                    auto &conn = connections_.emplace_front(std::make_unique<Connection>(std::move(socket)));
+                    auto conn = Connection::make(std::move(socket));
+                    connections_.emplace_front(conn);
 
                     conn->on_close([this, it = connections_.begin()]() noexcept { connections_.erase(it); });
 
