@@ -108,7 +108,7 @@ Usage: build/tools/expression-gen [options]
 - No control over work distribution: I use Linux socket option `so_reuseport` to delegate the connection load balacing to the OS. It may cause uneven works distribution and thread starvation. Solution for this might be sophisticated EBpf load balacing or Work-stealing scheduler.
 
 ## Expression generator
-- I use the recursive descent technique to randomly generate the expression, this is a common technique in writing parser.
+- I use recursive descent technique to randomly generate the expression, this is a common technique for writing parser.
 - Due to that fact that the server only support int64, the output must be controlled so that it doesn't overflow.
 ### Grammar
 ```txt
