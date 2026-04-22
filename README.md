@@ -45,8 +45,13 @@ ctest --test-dir build --output-on-failure
 
 ## Usage
 ```sh
-# Run server at port 8000
-./expression-calculator-server 8000
+./expression-calculator-server -h
+
+Usage: ./build/src/expression-calculator-server [options]
+  --host HOST  Server hostname/IP.
+  --port PORT  Server port.
+  --threads N  Number of IO threads (default to number of cpus).
+  --help N     Print this message and exit.
 ```
 
 ## Running an example

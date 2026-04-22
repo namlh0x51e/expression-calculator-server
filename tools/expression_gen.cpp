@@ -11,7 +11,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
-#include <new>
 #include <ostream>
 #include <random>
 #include <string>
@@ -161,6 +160,7 @@ struct Config {
     std::string host;
     std::string port;
     int connections = 1;
+    int threads = 1;
 
     [[nodiscard]] bool tcp_mode() const noexcept { return !host.empty() && !port.empty(); }
 };
@@ -175,6 +175,7 @@ auto print_usage(const char* prog) noexcept -> void
                  "  --host HOST      Server hostname/IP (enables TCP client mode).\n"
                  "  --port PORT      Server port (required with --host).\n"
                  "  --connections N  Concurrent TCP connections in TCP mode (default: 1).\n"
+                 "  --threads N      I/O threads for TCP mode (default: 1).\n"
                  "  --help           Print this message and exit.",
                  prog);
 }
@@ -231,6 +232,9 @@ auto parse_args(int argc, char** argv) noexcept -> Config
         } else if (arg == "--connections") {
             cfg.connections = static_cast<int>(std::strtol(need_next(arg), nullptr, 10));
             if (cfg.connections < 1) cfg.connections = 1;
+        } else if (arg == "--threads") {
+            cfg.threads = static_cast<int>(std::strtol(need_next(arg), nullptr, 10));
+            if (cfg.threads < 1) cfg.threads = 1;
         } else {
             std::println(std::cerr, "error: unknown option '{}'", arg);
             print_usage(argv[0]);
@@ -352,7 +356,14 @@ auto run_tcp_client(const Config& cfg) -> void
     }
 
     auto t_start = std::chrono::steady_clock::now();
+
+    std::vector<std::thread> pool;
+    pool.reserve(static_cast<std::size_t>(cfg.threads - 1));
+    for (int t = 1; t < cfg.threads; ++t)
+        pool.emplace_back([&ioc] { ioc.run(); });
     ioc.run();
+    for (auto& t : pool) t.join();
+
     double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
 
     print_summary(stats, elapsed);
