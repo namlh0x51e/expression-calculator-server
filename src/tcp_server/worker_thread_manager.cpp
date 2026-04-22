@@ -30,8 +30,10 @@ auto WorkerThreadManager::WorkerThread::serve(std::string_view address, uint16_t
 
 auto WorkerThreadManager::WorkerThread::join() noexcept -> void
 {
-    tcp_server_.stop();   // cancel accept loop; in-flight connections keep running
-    work_guard_.reset();  // io_context exits when all connections close
+    asio::post(ctx_, [this]() noexcept {
+        tcp_server_.stop();
+        work_guard_.reset();
+    });
     thread_.join();
 }
 

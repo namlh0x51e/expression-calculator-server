@@ -21,25 +21,23 @@ auto Connection::start() noexcept -> void
         auto self = weak.lock();
         if (!self) return;
         asio::post(self->socket_.get_executor(), [self, result]() {
-            auto handler = [self](std::error_code ec, auto) mutable {
-                if (ec) {
-                    spdlog::error("Write back result failed: {}", ec.message());
-                }
-            };
-
             if (result) {
                 spdlog::debug("Write back result value: {}", *result);
-                // int64_t is at most 20 characters long
-                std::array<char, 24> reply;
-                auto to_chars_res = std::to_chars(reply.data(), reply.data() + reply.size(), *result);
-                auto n = to_chars_res.ptr - reply.data();
-                assert(n >= 0);
-                reply[static_cast<std::size_t>(n++)] = '\n';
-                asio::async_write(self->socket_, asio::buffer(reply.data(), static_cast<std::size_t>(n)),
-                                  std::move(handler));
+                auto reply = std::make_unique<std::array<char, 24>>();
+                auto to_chars_res = std::to_chars(reply->data(), reply->data() + reply->size(), *result);
+                auto n = static_cast<std::size_t>(to_chars_res.ptr - reply->data());
+                (*reply)[n++] = '\n';
+                auto buf = asio::buffer(reply->data(), n);
+                asio::async_write(self->socket_, buf,
+                                  [self, reply = std::move(reply)](std::error_code ec, auto) mutable {
+                                      if (ec) spdlog::error("Write back result failed: {}", ec.message());
+                                  });
             } else {
                 spdlog::debug("Write back result value: \"SYNTAX ERROR\"");
-                asio::async_write(self->socket_, asio::buffer("SYNTAX ERROR\n"), std::move(handler));
+                asio::async_write(self->socket_, asio::buffer("SYNTAX ERROR\n"),
+                                  [self](std::error_code ec, auto) {
+                                      if (ec) spdlog::error("Write back result failed: {}", ec.message());
+                                  });
             }
         });
     });
