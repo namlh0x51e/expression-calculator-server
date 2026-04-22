@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <new>
 #include <ostream>
 #include <random>
 #include <string>
@@ -24,21 +25,21 @@ struct Range {
     __int128 lo, hi;
 };
 
-static constexpr __int128 I64_MAX_128 = INT64_MAX;
-static constexpr __int128 I64_MIN_128 = INT64_MIN;
+constexpr __int128 I64_MAX_128 = INT64_MAX;
+constexpr __int128 I64_MIN_128 = INT64_MIN;
 
-static bool in_i64(Range r) noexcept { return r.lo >= I64_MIN_128 && r.hi <= I64_MAX_128; }
+bool in_i64(Range r) noexcept { return r.lo >= I64_MIN_128 && r.hi <= I64_MAX_128; }
 
-static Range range_add(Range a, Range b) noexcept { return {a.lo + b.lo, a.hi + b.hi}; }
-static Range range_sub(Range a, Range b) noexcept { return {a.lo - b.hi, a.hi - b.lo}; }
+Range range_add(Range a, Range b) noexcept { return {a.lo + b.lo, a.hi + b.hi}; }
+Range range_sub(Range a, Range b) noexcept { return {a.lo - b.hi, a.hi - b.lo}; }
 
-static Range range_mul(Range a, Range b) noexcept
+Range range_mul(Range a, Range b) noexcept
 {
     __int128 p[4] = {a.lo * b.lo, a.lo * b.hi, a.hi * b.lo, a.hi * b.hi};
     return {*std::min_element(p, p + 4), *std::max_element(p, p + 4)};
 }
 
-static Range range_div(Range a, Range b) noexcept
+Range range_div(Range a, Range b) noexcept
 {
     assert(b.lo >= 1);
     return {a.lo / b.hi, a.hi / b.lo};
@@ -47,12 +48,12 @@ static Range range_div(Range a, Range b) noexcept
 class OutputBuffer {
     static constexpr std::size_t CAPACITY = 4 * 1024 * 1024;
 
-    alignas(64) char buf_[CAPACITY];
+    char buf_[CAPACITY];
     std::size_t pos_ = 0;
     std::size_t written_ = 0;
 
    public:
-    void put(char c)
+    auto put(char c) noexcept -> void
     {
         buf_[pos_++] = c;
         if (pos_ == CAPACITY) flush();
@@ -63,12 +64,12 @@ class OutputBuffer {
         for (char c : sv) put(c);
     }
 
-    void flush()
+    auto flush() noexcept -> void
     {
         if (pos_ == 0) return;
         std::size_t off = 0;
         while (off < pos_) {
-            auto n = write(STDOUT_FILENO, buf_ + off, pos_ - off);
+            auto n = ::write(STDOUT_FILENO, buf_ + off, pos_ - off);
             if (n <= 0) std::exit(0);
             off += static_cast<std::size_t>(n);
         }
@@ -76,8 +77,8 @@ class OutputBuffer {
         pos_ = 0;
     }
 
-    [[nodiscard]] std::size_t bytes_written() const noexcept { return written_; }
-    [[nodiscard]] std::size_t buffered() const noexcept { return pos_; }
+    [[nodiscard]] auto bytes_written() const noexcept -> std::size_t { return written_; }
+    [[nodiscard]] auto buffered() const noexcept -> std::size_t { return pos_; }
 };
 
 class ExpressionGenerator {
@@ -87,9 +88,9 @@ class ExpressionGenerator {
     std::uniform_int_distribution<int64_t> small_{1, 999};
     std::uniform_int_distribution<int64_t> large_{1000, 999999};
 
-    bool coin(double p) { return unit_(rng_) < p; }
+    auto coin(double p) noexcept -> bool { return unit_(rng_) < p; }
 
-    Range gen_number(std::string& acc)
+    auto gen_number(std::string& acc) noexcept -> Range
     {
         int64_t n = coin(0.7) ? small_(rng_) : large_(rng_);
         std::array<char, 20> tmp;
@@ -98,7 +99,7 @@ class ExpressionGenerator {
         return {n, n};
     }
 
-    Range gen_factor(int d, std::string& acc)
+    auto gen_factor(int d, std::string& acc) noexcept -> Range
     {
         double const p = (d >= 2) ? 0.65 : (d == 1 ? 0.25 : 0.0);
         if (d > 0 && coin(p)) {
@@ -110,7 +111,7 @@ class ExpressionGenerator {
         return gen_number(acc);
     }
 
-    Range gen_term(int d, std::string& acc)
+    auto gen_term(int d, std::string& acc) noexcept -> Range
     {
         auto r_acc = gen_factor(d, acc);
         while (coin(0.5)) {
@@ -127,7 +128,7 @@ class ExpressionGenerator {
         return r_acc;
     }
 
-    Range gen_expr(int d, std::string& acc)
+    auto gen_expr(int d, std::string& acc) noexcept -> Range
     {
         auto r_acc = gen_term(d, acc);
         while (coin(0.5)) {
@@ -146,7 +147,7 @@ class ExpressionGenerator {
    public:
     ExpressionGenerator(uint64_t seed, int max_depth) : rng_{seed}, max_depth_{max_depth} {}
 
-    void gen_expression(std::string& out)
+    auto gen_expression(std::string& out) noexcept -> void
     {
         gen_expr(max_depth_, out);
         out += '\n';
@@ -164,7 +165,7 @@ struct Config {
     [[nodiscard]] bool tcp_mode() const noexcept { return !host.empty() && !port.empty(); }
 };
 
-void print_usage(const char* prog)
+auto print_usage(const char* prog) noexcept -> void
 {
     std::println(std::cerr,
                  "Usage: {} [options]\n\n"
@@ -178,7 +179,7 @@ void print_usage(const char* prog)
                  prog);
 }
 
-int64_t parse_size(const char* s)
+auto parse_size(const char* s) noexcept -> int64_t
 {
     char* end;
     int64_t n = std::strtoll(s, &end, 10);
@@ -199,7 +200,7 @@ int64_t parse_size(const char* s)
     return n;
 }
 
-Config parse_args(int argc, char** argv)
+auto parse_args(int argc, char** argv) noexcept -> Config
 {
     Config cfg;
     for (int i = 1; i < argc; ++i) {
@@ -247,7 +248,7 @@ struct ConnectionStats {
     std::string error_message;
 };
 
-asio::awaitable<void> drain_reader(tcp::socket& socket, ConnectionStats& stats)
+auto drain_reader(tcp::socket& socket, ConnectionStats& stats) noexcept -> asio::awaitable<void>
 {
     std::array<char, 64 * 1024> buf;
     while (true) {
@@ -258,7 +259,7 @@ asio::awaitable<void> drain_reader(tcp::socket& socket, ConnectionStats& stats)
     }
 }
 
-asio::awaitable<void> run_connection(const Config& cfg, int conn_id, ConnectionStats& stats)
+auto run_connection(const Config& cfg, int conn_id, ConnectionStats& stats) noexcept -> asio::awaitable<void>
 {
     auto exec = co_await asio::this_coro::executor;
 
@@ -307,7 +308,7 @@ asio::awaitable<void> run_connection(const Config& cfg, int conn_id, ConnectionS
     socket.shutdown(tcp::socket::shutdown_send, sec);
 }
 
-void print_summary(const std::vector<ConnectionStats>& stats, double elapsed_sec)
+auto print_summary(const std::vector<ConnectionStats>& stats, double elapsed_sec) noexcept -> void
 {
     uint64_t total_exprs = 0;
     uint64_t total_bytes = 0;
@@ -341,7 +342,7 @@ void print_summary(const std::vector<ConnectionStats>& stats, double elapsed_sec
                  exprs_per_sec, mb_per_sec, errors);
 }
 
-void run_tcp_client(const Config& cfg)
+auto run_tcp_client(const Config& cfg) -> void
 {
     asio::io_context ioc;
     std::vector<ConnectionStats> stats(static_cast<std::size_t>(cfg.connections));
@@ -357,7 +358,7 @@ void run_tcp_client(const Config& cfg)
     print_summary(stats, elapsed);
 }
 
-int main(int argc, char** argv)
+auto main(int argc, char** argv) -> int
 {
     signal(SIGPIPE, SIG_IGN);
 

@@ -2,7 +2,6 @@
 
 #include <spdlog/fmt/bin_to_hex.h>
 
-#include <algorithm>
 #include <charconv>
 
 auto Connection::make(tcp::socket socket) noexcept -> std::shared_ptr<Connection>
@@ -23,21 +22,22 @@ auto Connection::start() noexcept -> void
         asio::post(self->socket_.get_executor(), [self, result]() {
             if (result) {
                 spdlog::debug("Write back result value: {}", *result);
+                // int64_t is only 20 characters long
                 auto reply = std::make_unique<std::array<char, 24>>();
                 auto to_chars_res = std::to_chars(reply->data(), reply->data() + reply->size(), *result);
                 auto n = static_cast<std::size_t>(to_chars_res.ptr - reply->data());
+                assert(n >= 0);
+                assert(n < reply.size() - 1);  // Count for '\n'
                 (*reply)[n++] = '\n';
-                auto buf = asio::buffer(reply->data(), n);
-                asio::async_write(self->socket_, buf,
+                asio::async_write(self->socket_, asio::buffer(reply->data(), n),
                                   [self, reply = std::move(reply)](std::error_code ec, auto) mutable {
                                       if (ec) spdlog::error("Write back result failed: {}", ec.message());
                                   });
             } else {
                 spdlog::debug("Write back result value: \"SYNTAX ERROR\"");
-                asio::async_write(self->socket_, asio::buffer("SYNTAX ERROR\n"),
-                                  [self](std::error_code ec, auto) {
-                                      if (ec) spdlog::error("Write back result failed: {}", ec.message());
-                                  });
+                asio::async_write(self->socket_, asio::buffer("SYNTAX ERROR\n"), [self](std::error_code ec, auto) {
+                    if (ec) spdlog::error("Write back result failed: {}", ec.message());
+                });
             }
         });
     });
