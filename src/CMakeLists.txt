@@ -1,19 +1,9 @@
-add_library(evaluation_engine STATIC tokenizer.cpp evaluation_engine.cpp)
+add_subdirectory(tcp_server)
 
-target_include_directories(evaluation_engine
-    PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}"
-)
-
-target_link_libraries(evaluation_engine
-    PUBLIC spdlog::spdlog
-)
-
-target_enable_warnings(evaluation_engine)
-
-add_executable(expression_calculator_server main.cpp)
+add_executable(expression_calculator_server main.cpp signal_listener.cpp)
 
 target_link_libraries(expression_calculator_server
-    PRIVATE evaluation_engine Asio
+    PRIVATE tcp_server
 )
 
 target_enable_warnings(expression_calculator_server)

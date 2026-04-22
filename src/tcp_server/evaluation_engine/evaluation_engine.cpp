@@ -3,17 +3,18 @@
 auto EvaluationEngine::eval(std::span<std::byte> buffer) noexcept -> std::size_t
 {
     if (error_.has_value()) {
-        // Mid-skip from a previous call — scan for the frame delimiter.
+        // Skip current frame until the next frame is met
         auto it =
             std::find_if(buffer.begin(), buffer.end(), [](std::byte b) { return static_cast<char>(b) == FRAME_DELIM; });
         if (it == buffer.end()) {
-            return 0;  // delimiter still not in this buffer; keep skipping next call
+            return 0;
         }
-        error_.reset();  // frame delimiter met — exit skip mode
-        // The full (invalid) expression has now been consumed; report the error.
+
+        error_.reset();
         if (on_done_) {
             on_done_(std::unexpected(EvalErrorInvalidSyntax{}));
         }
+        // Current position is the frame delimeter
         auto const delim_pos = static_cast<std::size_t>(it - buffer.begin());
         buffer = buffer.subspan(delim_pos + 1);
         if (buffer.empty()) return 0;

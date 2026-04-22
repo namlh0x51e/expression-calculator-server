@@ -16,9 +16,6 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(CompilerWarnings)
 
-# ── Dependency strategy ────────────────────────────────────────────────────────
-# By default, spdlog and Catch2 are resolved via find_package (system install)
-# first, and only downloaded via FetchContent if not found.
 # Pass -DFORCE_FETCH_CONTENT=ON to always download regardless of system packages.
 option(FORCE_FETCH_CONTENT "Always download dependencies via FetchContent, skip system packages" OFF)
 
@@ -28,14 +25,12 @@ endif()
 
 include(FetchContent)
 
-# Asio is not a standard CMake system package — always fetched.
 FetchContent_Declare(
     asio_dep
     URL "https://sourceforge.net/projects/asio/files/asio/1.36.0%20%28Stable%29/asio-1.36.0.zip/download"
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 
-# spdlog and Catch2: FIND_PACKAGE_ARGS opts in to trying find_package first.
 FetchContent_Declare(
     spdlog
     GIT_REPOSITORY https://github.com/gabime/spdlog.git
